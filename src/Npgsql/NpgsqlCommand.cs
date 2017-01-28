@@ -1,7 +1,7 @@
 #region License
 // The PostgreSQL License
 //
-// Copyright (C) 2016 The Npgsql Development Team
+// Copyright (C) 2017 The Npgsql Development Team
 //
 // Permission to use, copy, modify, and distribute this software and its
 // documentation for any purpose, without fee, and without a written
@@ -70,7 +70,6 @@ namespace Npgsql
         NpgsqlConnector _connectorPreparedOn;
 
         NpgsqlTransaction _transaction;
-        readonly SqlQueryParser _sqlParser = new SqlQueryParser();
         string _commandText;
         int? _timeout;
         readonly NpgsqlParameterCollection _parameters;
@@ -134,7 +133,7 @@ namespace Npgsql
         public NpgsqlCommand(string cmdText, [CanBeNull] NpgsqlConnection connection, [CanBeNull] NpgsqlTransaction transaction)
         {
             GC.SuppressFinalize(this);
-            _statements = new List<NpgsqlStatement>();
+            _statements = new List<NpgsqlStatement>(1);
             _parameters = new NpgsqlParameterCollection();
             _commandText = cmdText;
             Connection = connection;
@@ -404,60 +403,69 @@ namespace Npgsql
         public override void Prepare()
         {
             var connector = CheckReadyAndGetConnector();
-            if (Parameters.Any(p => !p.IsTypeExplicitlySet))
-                throw new InvalidOperationException("The Prepare method requires all parameters to have an explicitly set type.");
-
-            ProcessRawQuery();
-
-            Log.Preparing(connector.Id, CommandText);
             using (connector.StartUserAction())
             {
-                foreach (var statement in _statements.Where(s => !s.IsPrepared))
+                for (var i = 0; i < Parameters.Count; i++)
+                    if (!Parameters[i].IsTypeExplicitlySet)
+                        throw new InvalidOperationException("The Prepare method requires all parameters to have an explicitly set type.");
+
+                ProcessRawQuery();
+
+                Log.Preparing(connector.Id, CommandText);
+
+                var needToPrepare = false;
+                foreach (var statement in _statements)
+                {
+                    if (statement.IsPrepared)
+                        continue;
                     statement.PreparedStatement = connector.PreparedStatementManager.GetOrAddExplicit(statement);
+                    if (statement.PreparedStatement?.State == PreparedState.NotYetPrepared)
+                        needToPrepare = true;
+                }
 
                 // It's possible the command was already prepared, or that presistent prepared statements were found for
-                // all statements - nothing to do.
-                if (_statements.Any(s => s.PreparedStatement?.State == PreparedState.NotYetPrepared))
+                // all statements. Nothing to do here, move along.
+                if (!needToPrepare)
+                    return;
+
+                SendPrepare(false, CancellationToken.None).Wait();
+
+                // Loop over statements, skipping those that are already prepared (because they were persisted)
+                var isFirst = true;
+                foreach (var statement in _statements.Where(s => s.PreparedStatement?.State == PreparedState.BeingPrepared))
                 {
-                    SendPrepare(false, CancellationToken.None).Wait();
-
-                    // Loop over statements, skipping those that are already prepared (because they were persisted)
-                    var isFirst = true;
-                    foreach (var statement in _statements.Where(s => s.PreparedStatement?.State == PreparedState.BeingPrepared))
+                    var pStatement = statement.PreparedStatement;
+                    Debug.Assert(pStatement != null);
+                    Debug.Assert(pStatement.Description == null);
+                    if (pStatement.StatementBeingReplaced != null)
                     {
-                        var pStatement = statement.PreparedStatement;
-                        Debug.Assert(pStatement != null);
-                        Debug.Assert(pStatement.Description == null);
-                        if (pStatement.StatementBeingReplaced != null)
-                        {
-                            connector.ReadExpecting<CloseCompletedMessage>();
-                            pStatement.StatementBeingReplaced.CompleteUnprepare();
-                            pStatement.StatementBeingReplaced = null;
-                        }
-
-                        connector.ReadExpecting<ParseCompleteMessage>();
-                        connector.ReadExpecting<ParameterDescriptionMessage>();
-                        var msg = connector.ReadMessage(DataRowLoadingMode.NonSequential);
-                        switch (msg.Code)
-                        {
-                        case BackendMessageCode.RowDescription:
-                            var description = (RowDescriptionMessage)msg;
-                            FixupRowDescription(description, isFirst);
-                            statement.Description = description;
-                            break;
-                        case BackendMessageCode.NoData:
-                            statement.Description = null;
-                            break;
-                        default:
-                            throw connector.UnexpectedMessageReceived(msg.Code);
-                        }
-                        pStatement.CompletePrepare();
-                        isFirst = false;
+                        connector.ReadExpecting<CloseCompletedMessage>();
+                        pStatement.StatementBeingReplaced.CompleteUnprepare();
+                        pStatement.StatementBeingReplaced = null;
                     }
 
-                    connector.ReadExpecting<ReadyForQueryMessage>();
-                    CompleteRemainingSend();
+                    connector.ReadExpecting<ParseCompleteMessage>();
+                    connector.ReadExpecting<ParameterDescriptionMessage>();
+                    var msg = connector.ReadMessage(DataRowLoadingMode.NonSequential);
+                    switch (msg.Code)
+                    {
+                    case BackendMessageCode.RowDescription:
+                        var description = (RowDescriptionMessage)msg;
+                        FixupRowDescription(description, isFirst);
+                        statement.Description = description;
+                        break;
+                    case BackendMessageCode.NoData:
+                        statement.Description = null;
+                        break;
+                    default:
+                        throw connector.UnexpectedMessageReceived(msg.Code);
+                    }
+                    pStatement.CompletePrepare();
+                    isFirst = false;
                 }
+
+                connector.ReadExpecting<ReadyForQueryMessage>();
+                CompleteRemainingSend();
 
                 _connectorPreparedOn = connector;
             }
@@ -500,8 +508,9 @@ namespace Npgsql
             NpgsqlStatement statement;
             switch (CommandType) {
             case CommandType.Text:
-                _sqlParser.ParseRawQuery(CommandText, _connection == null || _connection.UseConformantStrings, _parameters, _statements);
-                if (_statements.Count > 1 && _parameters.Any(p => p.IsOutputDirection))
+                Debug.Assert(_connection?.Connector != null);
+                _connection.Connector.SqlParser.ParseRawQuery(CommandText, _connection == null || _connection.UseConformantStrings, _parameters, _statements);
+                if (_statements.Count > 1 && _parameters.HasOutputParameters)
                     throw new NotSupportedException("Commands with multiple queries cannot have out parameters");
                 break;
 
@@ -574,8 +583,9 @@ namespace Npgsql
                 throw new InvalidOperationException($"Internal Npgsql bug: unexpected value {CommandType} of enum {nameof(CommandType)}. Please file a bug.");
             }
 
-            if (Statements.Any(s => s.InputParameters.Count > 65535))
-                throw new Exception("A statement cannot have more than 65535 parameters");
+            foreach (var s in _statements)
+                if (s.InputParameters.Count > 65535)
+                    throw new Exception("A statement cannot have more than 65535 parameters");
 
             _isParsed = true;
         }

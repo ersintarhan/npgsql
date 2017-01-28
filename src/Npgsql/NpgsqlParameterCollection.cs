@@ -1,7 +1,7 @@
 #region License
 // The PostgreSQL License
 //
-// Copyright (C) 2016 The Npgsql Development Team
+// Copyright (C) 2017 The Npgsql Development Team
 //
 // Permission to use, copy, modify, and distribute this software and its
 // documentation for any purpose, without fee, and without a written
@@ -39,7 +39,7 @@ namespace Npgsql
 
     public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<NpgsqlParameter>
     {
-        readonly List<NpgsqlParameter> _internalList = new List<NpgsqlParameter>();
+        readonly List<NpgsqlParameter> _internalList = new List<NpgsqlParameter>(5);
 
         // Dictionary lookups for GetValue to improve performance
         Dictionary<string, int> _lookup;
@@ -812,6 +812,17 @@ namespace Npgsql
             }
             other._lookup = _lookup;
             other._lookupIgnoreCase = _lookupIgnoreCase;
+        }
+
+        internal bool HasOutputParameters
+        {
+            get
+            {
+                foreach (var p in _internalList)
+                    if (p.IsOutputDirection)
+                        return true;
+                return false;
+            }
         }
     }
 }

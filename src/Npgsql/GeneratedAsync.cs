@@ -134,6 +134,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
@@ -273,14 +274,11 @@ namespace Npgsql
                     await Connector.OpenAsync(timeout, cancellationToken);
                     Counters.NumberOfNonPooledConnections.Increment();
                 }
-
 #if NET45 || NET451
                 // We may have gotten an already enlisted pending connector above, no need to enlist in that case
                 if (Settings.Enlist && Transaction.Current != null && EnlistedTransaction == null)
                     EnlistTransaction(Transaction.Current);
 #endif
-                Connector.Notice += _noticeDelegate;
-                Connector.Notification += _notificationDelegate;
             }
             catch
             {
@@ -469,7 +467,6 @@ namespace Npgsql
             PostgresException error = null;
             while (true)
             {
-                var buf = ReadBuffer;
                 await ReadBuffer.EnsureAsync(5, cancellationToken, readingNotifications);
                 var messageCode = (BackendMessageCode)ReadBuffer.ReadByte();
                 PGUtil.ValidateBackendMessageCode(messageCode);
@@ -484,17 +481,23 @@ namespace Npgsql
                 }
                 else if (len > ReadBuffer.ReadBytesLeft)
                 {
-                    buf = await (buf.EnsureOrAllocateTempAsync(len, cancellationToken));
+                    if (len > ReadBuffer.Size)
+                    {
+                        _origReadBuffer = ReadBuffer;
+                        ReadBuffer = await (ReadBuffer.AllocateOversizeAsync(len, cancellationToken));
+                    }
+
+                    await ReadBuffer.EnsureAsync(len, cancellationToken);
                 }
 
-                var msg = ParseServerMessage(buf, messageCode, len, dataRowLoadingMode, isPrependedMessage);
+                var msg = ParseServerMessage(ReadBuffer, messageCode, len, dataRowLoadingMode, isPrependedMessage);
                 switch (messageCode)
                 {
                     case BackendMessageCode.ErrorResponse:
                         Debug.Assert(msg == null);
                         // An ErrorResponse is (almost) always followed by a ReadyForQuery. Save the error
                         // and throw it as an exception when the ReadyForQuery is received (next).
-                        error = new PostgresException(buf);
+                        error = new PostgresException(ReadBuffer);
                         if (State == ConnectorState.Connecting)
                         {
                             // During the startup/authentication phase, an ErrorResponse isn't followed by
@@ -725,18 +728,7 @@ namespace Npgsql
                 // We got a new resultset.
                 // Read the next message and store it in _pendingRow, this is to make sure that if the
                 // statement generated an error, it gets thrown here and not on the first call to Read().
-                // Check if the user specified any output parameters, populate those if needed
-                var hasOutputParams = false;
-                for (var i = 0; i < Command.Parameters.Count; i++)
-                {
-                    if (Command.Parameters[i].IsOutputDirection)
-                    {
-                        hasOutputParams = true;
-                        break;
-                    }
-                }
-
-                if (_statementIndex == 0 && hasOutputParams)
+                if (_statementIndex == 0 && Command.Parameters.HasOutputParameters)
                 {
                     // If output parameters are present and this is the first row of the first resultset,
                     // we must read it in non-sequential mode because it will be traversed twice (once
@@ -1203,21 +1195,12 @@ namespace Npgsql
             await EnsureAsync(ReadBytesLeft + 1, cancellationToken);
         }
 
-        internal async Task<ReadBuffer> EnsureOrAllocateTempAsync(int count, CancellationToken cancellationToken, bool dontBreakOnTimeouts = false)
+        internal async Task<ReadBuffer> AllocateOversizeAsync(int count, CancellationToken cancellationToken)
         {
-            if (count <= Size)
-            {
-                await EnsureAsync(count, cancellationToken, dontBreakOnTimeouts);
-                return this;
-            }
-
-            // Worst case: our buffer isn't big enough. For now, allocate a new buffer
-            // and copy into it
-            // TODO: Optimize with a pool later?
+            Debug.Assert(count > Size);
             var tempBuf = new ReadBuffer(Connector, Underlying, count, TextEncoding);
             CopyTo(tempBuf);
             Clear();
-            await tempBuf.EnsureAsync(count, cancellationToken, dontBreakOnTimeouts);
             return tempBuf;
         }
 

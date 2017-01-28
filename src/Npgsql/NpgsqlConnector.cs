@@ -1,7 +1,7 @@
 #region License
 // The PostgreSQL License
 //
-// Copyright (C) 2016 The Npgsql Development Team
+// Copyright (C) 2017 The Npgsql Development Team
 //
 // Permission to use, copy, modify, and distribute this software and its
 // documentation for any purpose, without fee, and without a written
@@ -84,6 +84,13 @@ namespace Npgsql
         internal ReadBuffer ReadBuffer { get; private set; }
 
         /// <summary>
+        /// If we read a data row that's bigger than <see cref="ReadBuffer"/>, we allocate an oversize buffer.
+        /// The original (smaller) buffer is stored here, and restored when the connection is reset.
+        /// </summary>
+        [CanBeNull]
+        ReadBuffer _origReadBuffer;
+
+        /// <summary>
         /// Buffer used for writing data.
         /// </summary>
         internal WriteBuffer WriteBuffer { get; private set; }
@@ -136,6 +143,7 @@ namespace Npgsql
         /// The NpgsqlConnection that (currently) owns this connector. Null if the connector isn't
         /// owned (i.e. idle in the pool)
         /// </summary>
+        [CanBeNull]
         internal NpgsqlConnection Connection { get; set; }
 
         /// <summary>
@@ -181,6 +189,10 @@ namespace Npgsql
         /// we need to change it when commands are received.
         /// </summary>
         int _currentTimeout;
+
+        // This is used by NpgsqlCommand, but we place it on the connector because only one instance is needed
+        // at any one time (per connection).
+        internal SqlQueryParser SqlParser { get; } = new SqlQueryParser();
 
         /// <summary>
         /// A lock that's taken while a user action is in progress, e.g. a command being executed.
@@ -455,17 +467,38 @@ namespace Npgsql
         string GetUsername()
         {
             var username = Settings.Username;
+            if (!string.IsNullOrEmpty(username))
+                return Settings.Username;
+
 #if NET45 || NET451
-            if (string.IsNullOrEmpty(username) && PGUtil.IsWindows && Type.GetType("Mono.Runtime") == null)
-                username = WindowsUsernameProvider.GetUserName(Settings.IncludeRealm);
-            if (string.IsNullOrEmpty(username))
-                username = Environment.UserName;
+            if (PGUtil.IsWindows && Type.GetType("Mono.Runtime") == null)
+            {
+                username = WindowsUsernameProvider.GetUsername(Settings.IncludeRealm);
+                if (!string.IsNullOrEmpty(username))
+                    return username;
+            }
 #endif
-            if (string.IsNullOrEmpty(username))
-                username = Environment.GetEnvironmentVariable("USERNAME") ??
-                       Environment.GetEnvironmentVariable("USER");
+
+            if (!PGUtil.IsWindows)
+            {
+                username = KerberosUsernameProvider.GetUsername(Settings.IncludeRealm);
+                if (!string.IsNullOrEmpty(username))
+                    return username;
+            }
+
+#if NET45 || NET451
+            username = Environment.UserName;
+            if (!string.IsNullOrEmpty(username))
+                return username;
+#endif
+
+            username = Environment.GetEnvironmentVariable("USERNAME") ?? Environment.GetEnvironmentVariable("USER");
+            if (!string.IsNullOrEmpty(username))
+                return username;
+
             if (username == null)
-                throw new Exception("No username could be found, please specify one explicitly");
+                throw new NpgsqlException("No username could be found, please specify one explicitly");
+
             return username;
         }
 
@@ -825,8 +858,6 @@ namespace Npgsql
 
             while (true)
             {
-                var buf = ReadBuffer;
-
                 ReadBuffer.Ensure(5, readingNotifications);
                 var messageCode = (BackendMessageCode)ReadBuffer.ReadByte();
                 PGUtil.ValidateBackendMessageCode(messageCode);
@@ -843,10 +874,16 @@ namespace Npgsql
                 }
                 else if (len > ReadBuffer.ReadBytesLeft)
                 {
-                    buf = buf.EnsureOrAllocateTemp(len);
+                    if (len > ReadBuffer.Size)
+                    {
+                        if (_origReadBuffer == null)
+                            _origReadBuffer = ReadBuffer;
+                        ReadBuffer = ReadBuffer.AllocateOversize(len);
+                    }
+                    ReadBuffer.Ensure(len);
                 }
 
-                var msg = ParseServerMessage(buf, messageCode, len, dataRowLoadingMode, isPrependedMessage);
+                var msg = ParseServerMessage(ReadBuffer, messageCode, len, dataRowLoadingMode, isPrependedMessage);
 
                 switch (messageCode) {
                 case BackendMessageCode.ErrorResponse:
@@ -854,7 +891,7 @@ namespace Npgsql
 
                     // An ErrorResponse is (almost) always followed by a ReadyForQuery. Save the error
                     // and throw it as an exception when the ReadyForQuery is received (next).
-                    error = new PostgresException(buf);
+                    error = new PostgresException(ReadBuffer);
 
                     if (State == ConnectorState.Connecting) {
                         // During the startup/authentication phase, an ErrorResponse isn't followed by
@@ -928,10 +965,10 @@ namespace Npgsql
                     HandleParameterStatus(buf.ReadNullTerminatedString(), buf.ReadNullTerminatedString());
                     return null;
                 case BackendMessageCode.NoticeResponse:
-                    OnNotice(new PostgresNotice(buf));
+                    Connection?.OnNotice(new PostgresNotice(buf));
                     return null;
                 case BackendMessageCode.NotificationResponse:
-                    OnNotification(new NpgsqlNotificationEventArgs(buf));
+                    Connection?.OnNotification(new NpgsqlNotificationEventArgs(buf));
                     return null;
 
                 case BackendMessageCode.AuthenticationRequest:
@@ -1136,52 +1173,6 @@ namespace Npgsql
         }
 
         #endregion
-
-        #region Notifications
-
-        /// <summary>
-        /// Occurs on NoticeResponses from the PostgreSQL backend.
-        /// </summary>
-        internal event NoticeEventHandler Notice;
-
-        /// <summary>
-        /// Occurs on NotificationResponses from the PostgreSQL backend.
-        /// </summary>
-        internal event NotificationEventHandler Notification;
-
-        void OnNotice(PostgresNotice e)
-        {
-            var notice = Notice;
-            if (notice != null)
-            {
-                try
-                {
-                    notice(this, new NpgsqlNoticeEventArgs(e));
-                }
-                catch
-                {
-                    // Ignore all exceptions bubbling up from the user's event handler
-                }
-            }
-        }
-
-        void OnNotification(NpgsqlNotificationEventArgs e)
-        {
-            var notification = Notification;
-            if (notification != null)
-            {
-                try
-                {
-                    notification(this, e);
-                }
-                catch
-                {
-                    // Ignore all exceptions bubbling up from the user's event handler
-                }
-            }
-        }
-
-        #endregion Notifications
 
         #region SSL
 
@@ -1437,6 +1428,13 @@ namespace Npgsql
             // Our buffer may contain unsent prepended messages (such as BeginTransaction), clear it out completely
             WriteBuffer.Clear();
             _pendingPrependedResponses = 0;
+
+            // We may have allocated an oversize read buffer, switch back to the original one
+            if (_origReadBuffer != null)
+            {
+                ReadBuffer = _origReadBuffer;
+                _origReadBuffer = null;
+            }
 
             // Must rollback transaction before sending DISCARD ALL
             switch (TransactionStatus)

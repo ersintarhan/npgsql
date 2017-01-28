@@ -1,7 +1,7 @@
 #region License
 // The PostgreSQL License
 //
-// Copyright (C) 2016 The Npgsql Development Team
+// Copyright (C) 2017 The Npgsql Development Team
 //
 // Permission to use, copy, modify, and distribute this software and its
 // documentation for any purpose, without fee, and without a written
@@ -981,6 +981,47 @@ namespace Npgsql.Tests
                 {
                     adminConn.ExecuteNonQuery("DROP DATABASE IF EXISTS sqlascii");
                 }
+            }
+        }
+
+        [Test]
+        public void OversizeBuffer()
+        {
+            var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
+            {
+                ApplicationName = nameof(OversizeBuffer)
+            };
+            using (var conn = OpenConnection(csb))
+            {
+                Assert.That(conn.Connector.ReadBuffer.Size, Is.EqualTo(csb.ReadBufferSize));
+
+                // Read a big row, we should now be using an oversize buffer
+                var bigString1 = new string('x', csb.ReadBufferSize + 10);
+                using (var cmd = new NpgsqlCommand($"SELECT '{bigString1}'", conn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    Assert.That(reader.GetString(0), Is.EqualTo(bigString1));
+                }
+                var size1 = conn.Connector.ReadBuffer.Size;
+                Assert.That(conn.Connector.ReadBuffer.Size, Is.GreaterThan(csb.ReadBufferSize));
+
+                // Even bigger oversize buffer
+                var bigString2 = new string('x', csb.ReadBufferSize + 20);
+                using (var cmd = new NpgsqlCommand($"SELECT '{bigString2}'", conn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    Assert.That(reader.GetString(0), Is.EqualTo(bigString2));
+                }
+                Assert.That(conn.Connector.ReadBuffer.Size, Is.GreaterThan(size1));
+
+                var processId = conn.ProcessID;
+                conn.Close();
+                conn.Open();
+                Assert.That(conn.ProcessID, Is.EqualTo(processId));
+                Assert.That(conn.Connector.ReadBuffer.Size, Is.EqualTo(csb.ReadBufferSize));
+
             }
         }
 
